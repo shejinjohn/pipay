@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IPPAY – Real Platform</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <style>
+    * { font-family: 'Inter', sans-serif; }
+    body { background: #0a0c12; }
+    .gradient-card { background: linear-gradient(145deg, #11161f 0%, #0c0f17 100%); border: 1px solid rgba(64,128,255,0.15); }
+    .live-ticker { background: #0f1119; border-bottom: 1px solid #2a3248; padding: 10px 16px; display: flex; flex-wrap: wrap; gap: 24px; justify-content: space-around; font-family: monospace; }
+    .ticker-item { color: #b9c8ff; }
+    .toast-notify { position: fixed; top: 20px; right: 20px; background: #1e2a3a; border-left: 4px solid #22c55e; padding: 12px 20px; border-radius: 12px; z-index: 999; }
+  </style>
+</head>
+<body class="text-gray-200">
+  <div id="toastContainer"></div>
+  <div id="app"></div>
+
+  <script>
+    // ---------- SUPABASE CONFIG (replace with your own keys!) ----------
+    const SUPABASE_URL = 'https://YOUR_PROJECT.supabase.co';
+    const SUPABASE_ANON_KEY = 'YOUR_ANON_KEY';
+    const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+    let currentUser = null;
+    let livePrices = { usdtinr: 98.2, btcusd: 67842, ethusd: 3521, solusd: 178 };
+    let tickerInterval = null;
+
+    function showToast(msg, type = 'success') {
+      const container = document.getElementById('toastContainer');
+      const toast = document.createElement('div');
+      toast.className = 'toast-notify animate-pulse';
+      toast.innerHTML = `<i class="fas ${type === 'success' ? 'fa-check-circle text-green-400' : 'fa-info-circle text-blue-400'} mr-2"></i> ${msg}`;
+      container.appendChild(toast);
+      setTimeout(() => toast.remove(), 3000);
+    }
+
+    // ---------- LIVE TICKER (same as before, no changes) ----------
+    async function fetchUSDTINR() {
+      try {
+        const res = await fetch('https://api.exchangerate.host/convert?from=USDT&to=INR');
+        const data = await res.json();
+        if (data.result) return data.result;
+        throw new Error();
+      } catch (e) { return livePrices.usdtinr; }
+    }
+    async function fetchCryptoUSD(coinId) {
+      try {
+        const url = `https://api.coingecko.com/api/v3/simple/price?ids=${coinId}&vs_currencies=usd`;
+        const res = await fetch(url);
+        const data = await res.json();
+        return data[coinId]?.usd || null;
+      } catch (e) { return null; }
+    }
+    async function updateLiveTicker() {
+      livePrices.usdtinr = await fetchUSDTINR();
+      livePrices.btcusd = await fetchCryptoUSD('bitcoin');
+      livePrices.ethusd = await fetchCryptoUSD('ethereum');
+      livePrices.solusd = await fetchCryptoUSD('solana');
+      const tickerSpan = document.getElementById('liveTickerData');
+      if (tickerSpan) {
+        tickerSpan.innerHTML = `
+          <span class="ticker-item"><i class="fas fa-coins"></i> USDT/INR: ₹${livePrices.usdtinr?.toFixed(2) || '---'}</span>
+          <span class="ticker-item"><i class="fab fa-bitcoin"></i> BTC/USD: $${livePrices.btcusd?.toFixed(0) || '---'}</span>
+          <span class="ticker-item"><i class="fab fa-ethereum"></i> ETH/USD: $${livePrices.ethusd?.toFixed(0) || '---'}</span>
+          <span class="ticker-item"><i class="fas fa-sun"></i> SOL/USD: $${livePrices.solusd?.toFixed(2) || '---'}</span>
+        `;
+      }
+    }
+    function startLiveTicker() {
+      if (tickerInterval) clearInterval(tickerInterval);
+      updateLiveTicker();
+      tickerInterval = setInterval(updateLiveTicker, 12000);
+    }
+
+    // ---------- DATABASE HELPERS ----------
+    async function getUserProfile(userId) {
+      const { data, error } = await supabase.from('profiles').select('*').eq('id', userId).single();
+      if (error) throw error;
+      return data;
+    }
+    async function updateUserBalance(userId, deltaINR, deltaUSDT) {
+      const { data: profile } = await supabase.from('profiles').select('balance_inr, balance_usdt').eq('id', userId).single();
+      const newINR = profile.balance_inr + deltaINR;
+      const newUSDT = profile.balance_usdt + deltaUSDT;
+      const { error } = await supabase.from('profiles').update({ balance_inr: newINR, balance_usdt: newUSDT }).eq('id', userId);
+      if (error) throw error;
+    }
+    async function addTransaction(userId, txObj) {
+      const tx = {
+        id: 'TXN' + Date.now() + Math.floor(Math.random()*1000),
+        user_id: userId,
+        type: txObj.type,
+        amount_inr: txObj.amountINR,
+        amount_usdt: txObj.amountUSDT,
+        status: txObj.status,
+        note: txObj.note,
+        to: txObj.to || null,
+        from: txObj.from || null,
+        timestamp: Date.now()
+      };
+      const { error } = await supabase.from('transactions').insert(tx);
+      if (error) throw error;
+    }
+
+    // ---------- ACTIONS (now using Supabase) ----------
+    async function sendUSDT(toEmail, amountUSDT) {
+      if (!currentUser) return;
+      if (amountUSDT <= 0) return showToast('Amount must be positive', 'error');
+      const { data: receiver, error: recErr } = await supabase.from('profiles').select('id, email').eq('email', toEmail).single();
+      if (recErr || !receiver) return showToast('Receiver email not registered', 'error');
+      const senderProfile = await getUserProfile(currentUser.id);
+      if (senderProfile.balance_usdt < amountUSDT) return showToast('Insufficient USDT balance', 'error');
+      const gasFee = amountUSDT * 0.001;
+      const totalDeduct = amountUSDT + gasFee;
+      if (senderProfile.balance_usdt < totalDeduct) return showToast(`Insufficient balance for gas fee (${gasFee.toFixed(2)} USDT)`, 'error');
+      await updateUserBalance(currentUser.id, 0, -totalDeduct);
+      await updateUserBalance(receiver.id, 0, amountUSDT);
+      const inrValue = amountUSDT * livePrices.usdtinr;
+      const gasINR = gasFee * livePrices.usdtinr;
+      await addTransaction(currentUser.id, { type: 'send', amountINR: -inrValue, amountUSDT: -amountUSDT, status: 'completed', note: `Sent ${amountUSDT} USDT to ${toEmail} (gas: ${gasFee.toFixed(2)} USDT)`, to: toEmail });
+      await addTransaction(receiver.id, { type: 'receive', amountINR: inrValue, amountUSDT: amountUSDT, status: 'completed', note: `Received ${amountUSDT} USDT from ${currentUser.email}`, from: currentUser.email });
+      await addTransaction(currentUser.id, { type: 'gas_fee', amountINR: -gasINR, amountUSDT: -gasFee, status: 'completed', note: 'Network fee (TRC20)' });
+      currentUser = await getUserProfile(currentUser.id);
+      renderDashboard();
+      showToast(`Sent ${amountUSDT} USDT to ${toEmail}`, 'success');
+    }
+
+    async function depositFunds(amountINR) {
+      if (!currentUser) return;
+      const usdtAmount = amountINR / livePrices.usdtinr;
+      await updateUserBalance(currentUser.id, amountINR, usdtAmount);
+      await addTransaction(currentUser.id, { type: 'deposit', amountINR: amountINR, amountUSDT: usdtAmount, status: 'completed', note: `Bank deposit ₹${amountINR}` });
+      currentUser = await getUserProfile(currentUser.id);
+      renderDashboard();
+      showToast(`₹${amountINR} added!`, 'success');
+    }
+
+    async function swap(amountUSDT, direction) {
+      if (!currentUser) return;
+      const rate = livePrices.usdtinr;
+      if (direction === 'usdt_to_inr') {
+        if (currentUser.balance_usdt < amountUSDT) return showToast('Insufficient USDT', 'error');
+        const inrValue = amountUSDT * rate;
+        await updateUserBalance(currentUser.id, inrValue, -amountUSDT);
+        await addTransaction(currentUser.id, { type: 'swap', amountINR: inrValue, amountUSDT: -amountUSDT, status: 'completed', note: `Swapped ${amountUSDT} USDT → INR` });
+      } else {
+        const inrNeeded = amountUSDT * rate;
+        if (currentUser.balance_inr < inrNeeded) return showToast('Insufficient INR', 'error');
+        await updateUserBalance(currentUser.id, -inrNeeded, amountUSDT);
+        await addTransaction(currentUser.id, { type: 'swap', amountINR: -inrNeeded, amountUSDT: amountUSDT, status: 'completed', note: `Swapped INR → ${amountUSDT} USDT` });
+      }
+      currentUser = await getUserProfile(currentUser.id);
+      renderDashboard();
+      showToast('Swap completed', 'success');
+    }
+
+    async function requestWithdraw(amountUSDT) {
+      if (!currentUser) return;
+      if (amountUSDT <= 0 || currentUser.balance_usdt < amountUSDT) return showToast('Invalid amount', 'error');
+      await addTransaction(currentUser.id, { type: 'withdraw', amountINR: -amountUSDT * livePrices.usdtinr, amountUSDT: -amountUSDT, status: 'pending', note: `Withdrawal request ${amountUSDT} USDT – awaiting approval` });
+      renderDashboard();
+      showToast(`Withdrawal request for ${amountUSDT} USDT submitted (pending 15s)`, 'info');
+      setTimeout(async () => {
+        const freshUser = await getUserProfile(currentUser.id);
+        if (freshUser.balance_usdt >= amountUSDT) {
+          await updateUserBalance(currentUser.id, 0, -amountUSDT);
+          // update pending transaction to completed
+          const { error } = await supabase.from('transactions').update({ status: 'completed' }).eq('user_id', currentUser.id).eq('type', 'withdraw').eq('status', 'pending').limit(1);
+          if (!error) showToast(`Withdrawal of ${amountUSDT} USDT approved`, 'success');
+          currentUser = await getUserProfile(currentUser.id);
+          renderDashboard();
+        } else {
+          showToast('Withdrawal failed: balance changed', 'error');
+        }
+      }, 15000);
+    }
+
+    async function generateAPIKey() {
+      const newKey = 'pk_live_' + Math.random().toString(36).substring(2, 18);
+      await supabase.from('profiles').update({ api_key: newKey }).eq('id', currentUser.id);
+      currentUser.api_key = newKey;
+      renderDashboard();
+      showToast('New API key generated', 'success');
+    }
+
+    async function exportTransactions() {
+      const { data } = await supabase.from('transactions').select('*').eq('user_id', currentUser.id).order('timestamp', { ascending: false });
+      let csv = "ID,Type,Amount INR,Amount USDT,Status,Note,Timestamp\n";
+      data.forEach(tx => {
+        csv += `${tx.id},${tx.type},${tx.amount_inr || 0},${tx.amount_usdt || 0},${tx.status},${tx.note || ''},${new Date(tx.timestamp).toLocaleString()}\n`;
+      });
+      const blob = new Blob([csv], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `ippay_transactions_${currentUser.email}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast('Transactions exported to CSV', 'success');
+    }
+
+    // ---------- AUTH & RENDER ----------
+    async function login(email, pass) {
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password: pass });
+      if (error) { showToast(error.message, 'error'); return false; }
+      const profile = await getUserProfile(data.user.id);
+      currentUser = { ...data.user, ...profile };
+      renderDashboard();
+      startLiveTicker();
+      return true;
+    }
+
+    async function signup(email, pass, name, referralCode) {
+      const { data, error } = await supabase.auth.signUp({ email, password: pass });
+      if (error) { showToast(error.message, 'error'); return false; }
+      let referredByUser = null;
+      if (referralCode) {
+        const { data: refUser } = await supabase.from('profiles').select('id, email').eq('referral_code', referralCode).single();
+        referredByUser = refUser;
+      }
+      const newReferralCode = 'REF' + Math.random().toString(36).substring(2, 8).toUpperCase();
+      await supabase.from('profiles').insert({
+        id: data.user.id,
+        email: email,
+        name: name,
+        balance_inr: 0,
+        balance_usdt: 0,
+        referral_code: newReferralCode,
+        referred_by: referredByUser?.email || null
+      });
+      if (referredByUser) {
+        const bonus = 10;
+        await updateUserBalance(referredByUser.id, 0, bonus);
+        await addTransaction(referredByUser.id, { type: 'referral_bonus', amountINR: bonus * livePrices.usdtinr, amountUSDT: bonus, status: 'completed', note: `Referral bonus for inviting ${email}` });
+        showToast(`You earned ${bonus} USDT referral bonus!`, 'success');
+      }
+      return login(email, pass);
+    }
+
+    async function logout() {
+      await supabase.auth.signOut();
+      currentUser = null;
+      if (tickerInterval) clearInterval(tickerInterval);
+      renderLogin();
+    }
+
+    async function loadPlatformStats() {
+      const { data } = await supabase.from('platform_stats').select('total_volume, referral_bonus').eq('id', 1).single();
+      return data || { total_volume: 0, referral_bonus: 10 };
+    }
+
+    // UI RENDER FUNCTIONS (similar to before, but now pulling from Supabase)
+    async function renderDashboard() {
+      if (!currentUser) { renderLogin(); return; }
+      const transactionsData = await supabase.from('transactions').select('*').eq('user_id', currentUser.id).order('timestamp', { ascending: false }).limit(10);
+      const transactions = transactionsData.data || [];
+      const stats = await loadPlatformStats();
+      document.getElementById('app').innerHTML = `
+        <div class="live-ticker" id="liveTickerBar"><div id="liveTickerData" class="flex flex-wrap justify-around w-full">Loading prices...</div></div>
+        <div class="max-w-7xl mx-auto px-4 py-6">
+          <div class="flex justify-between items-center mb-6"><div class="flex items-center gap-2"><i class="fas fa-bolt text-2xl text-cyan-500"></i><span class="font-black text-2xl text-white">IPPAY</span></div><button id="logoutBtn" class="bg-red-600/20 text-red-400 px-4 py-2 rounded-full">Logout</button></div>
+          <div class="grid md:grid-cols-2 gap-5 mb-8">
+            <div class="gradient-card p-5"><p class="text-gray-400">INR Balance</p><p class="text-3xl font-bold">₹ ${currentUser.balance_inr?.toLocaleString('en-IN') || 0}</p></div>
+            <div class="gradient-card p-5"><p class="text-gray-400">USDT Balance</p><p class="text-3xl font-bold">$${currentUser.balance_usdt?.toFixed(2) || 0}</p></div>
+          </div>
+          <div class="grid md:grid-cols-4 gap-4 mb-10">
+            <div class="gradient-card p-4"><h4>Send USDT</h4><input id="sendTo" placeholder="Email" class="w-full p-2 rounded bg-black/50"><input id="sendAmount" type="number" placeholder="USDT" class="w-full p-2 rounded bg-black/50 mt-2"><button id="sendBtn" class="w-full bg-cyan-700/60 py-2 rounded mt-2">Send</button></div>
+            <div class="gradient-card p-4"><h4>Deposit INR</h4><input id="depositAmount" type="number" placeholder="₹" class="w-full p-2 rounded bg-black/50"><button id="depositBtn" class="w-full bg-green-700/60 py-2 rounded mt-2">Add Funds</button></div>
+            <div class="gradient-card p-4"><h4>Swap</h4><input id="swapAmount" type="number" placeholder="USDT" class="w-full p-2 rounded bg-black/50"><div class="flex gap-2 mt-2"><button id="swapToINR" class="w-1/2 bg-purple-700/60 py-1 rounded">→ INR</button><button id="swapToUSDT" class="w-1/2 bg-purple-700/60 py-1 rounded">→ USDT</button></div></div>
+            <div class="gradient-card p-4"><h4>Withdraw USDT</h4><input id="withdrawAmount" type="number" placeholder="USDT" class="w-full p-2 rounded bg-black/50"><button id="withdrawBtn" class="w-full bg-red-700/60 py-2 rounded mt-2">Request</button></div>
+          </div>
+          <div class="flex flex-wrap gap-3 mb-8">
+            <button id="genApiBtn" class="bg-gray-700 px-4 py-2 rounded-full text-sm">Generate API Key</button>
+            <button id="exportBtn" class="bg-gray-700 px-4 py-2 rounded-full text-sm">Export CSV</button>
+            <div class="bg-gray-800/50 px-4 py-2 rounded-full text-sm">Referral code: <span class="text-cyan-400">${currentUser.referral_code}</span></div>
+          </div>
+          ${currentUser.api_key ? `<div class="mb-4 bg-black/40 p-2 rounded text-xs">API Key: ${currentUser.api_key}</div>` : ''}
+          <h3 class="text-xl font-bold mb-3">Recent Activity</h3>
+          <div class="overflow-x-auto"><table class="w-full text-sm"><thead><tr><th>ID</th><th>Type</th><th>INR</th><th>USDT</th><th>Status</th><th>Note</th></tr></thead><tbody>
+            ${transactions.map(tx => `<tr><td>${tx.id.slice(-8)}</td><td>${tx.type}</td><td class="${tx.amount_inr >= 0 ? 'text-green-400' : 'text-red-400'}">${tx.amount_inr ? (tx.amount_inr >=0 ? '+' : '') + '₹' + Math.abs(tx.amount_inr).toLocaleString() : '—'}</td><td>${tx.amount_usdt ? (tx.amount_usdt >=0 ? '+' : '') + '$' + Math.abs(tx.amount_usdt).toFixed(2) : '—'}</td><td><span class="px-2 py-0.5 rounded-full text-xs ${tx.status === 'completed' ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}">${tx.status}</span></td><td>${tx.note || ''}</td></tr>`).join('')}
+          </tbody></table></div>
+          <div class="mt-6 text-xs text-gray-400">Total platform volume: ₹${stats.total_volume?.toLocaleString() || 0}</div>
+        </div>
+      `;
+      document.getElementById('sendBtn')?.addEventListener('click', () => { const to = document.getElementById('sendTo').value.trim(); const amt = parseFloat(document.getElementById('sendAmount').value); if(to && amt) sendUSDT(to, amt); else showToast('Enter email and amount', 'error'); });
+      document.getElementById('depositBtn')?.addEventListener('click', () => { const amt = parseFloat(document.getElementById('depositAmount').value); if(amt>0) depositFunds(amt); else showToast('Enter amount', 'error'); });
+      document.getElementById('swapToINR')?.addEventListener('click', () => { const amt = parseFloat(document.getElementById('swapAmount').value); if(amt>0) swap(amt, 'usdt_to_inr'); else showToast('Enter amount', 'error'); });
+      document.getElementById('swapToUSDT')?.addEventListener('click', () => { const amt = parseFloat(document.getElementById('swapAmount').value); if(amt>0) swap(amt, 'inr_to_usdt'); else showToast('Enter amount', 'error'); });
+      document.getElementById('withdrawBtn')?.addEventListener('click', () => { const amt = parseFloat(document.getElementById('withdrawAmount').value); if(amt>0) requestWithdraw(amt); else showToast('Enter amount', 'error'); });
+      document.getElementById('genApiBtn')?.addEventListener('click', generateAPIKey);
+      document.getElementById('exportBtn')?.addEventListener('click', exportTransactions);
+      document.getElementById('logoutBtn')?.addEventListener('click', logout);
+      updateLiveTicker();
+    }
+
+    function renderLogin() {
+      document.getElementById('app').innerHTML = `
+        <div class="min-h-screen flex items-center justify-center px-4">
+          <div class="gradient-card rounded-2xl p-8 max-w-md w-full">
+            <div class="text-center mb-6"><i class="fas fa-bolt text-4xl text-cyan-500"></i><h1 class="text-3xl font-black text-white">IPPAY</h1><p class="text-gray-400">Real Platform</p></div>
+            <form id="loginForm" class="space-y-4">
+              <input type="email" id="loginEmail" placeholder="Email" class="w-full p-3 rounded-xl bg-black/40 border border-gray-700" required>
+              <input type="password" id="loginPass" placeholder="Password" class="w-full p-3 rounded-xl bg-black/40 border border-gray-700" required>
+              <button type="submit" class="w-full bg-cyan-600 py-3 rounded-xl font-bold">Login</button>
+            </form>
+            <p class="text-center text-sm mt-4">New? <button id="showSignup" class="text-cyan-400">Create account</button></p>
+          </div>
+        </div>
+      `;
+      document.getElementById('loginForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const email = document.getElementById('loginEmail').value.trim();
+        const pass = document.getElementById('loginPass').value;
+        await login(email, pass);
+      });
+      document.getElementById('showSignup').addEventListener('click', () => {
+        document.getElementById('app').innerHTML = `
+          <div class="min-h-screen flex items-center justify-center px-4">
+            <div class="gradient-card rounded-2xl p-8 max-w-md w-full">
+              <h2 class="text-2xl font-bold text-center mb-4">Sign Up</h2>
+              <form id="signupForm" class="space-y-4">
+                <input type="text" id="signupName" placeholder="Full name" class="w-full p-3 rounded-xl bg-black/40">
+                <input type="email" id="signupEmail" placeholder="Email" class="w-full p-3 rounded-xl bg-black/40" required>
+                <input type="password" id="signupPass" placeholder="Password" class="w-full p-3 rounded-xl bg-black/40" required>
+                <input type="text" id="signupRef" placeholder="Referral code (optional)" class="w-full p-3 rounded-xl bg-black/40">
+                <button type="submit" class="w-full bg-cyan-600 py-3 rounded-xl font-bold">Sign Up</button>
+              </form>
+              <p class="text-center text-sm mt-4"><button id="backLogin" class="text-cyan-400">← Back</button></p>
+            </div>
+          </div>
+        `;
+        document.getElementById('signupForm').addEventListener('submit', async (e) => {
+          e.preventDefault();
+          const email = document.getElementById('signupEmail').value.trim();
+          const pass = document.getElementById('signupPass').value;
+          const name = document.getElementById('signupName').value;
+          const ref = document.getElementById('signupRef').value.trim() || null;
+          await signup(email, pass, name, ref);
+        });
+        document.getElementById('backLogin').addEventListener('click', () => renderLogin());
+      });
+    }
+
+    // Check if user is already logged in (Supabase session)
+    async function checkSession() {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session) {
+        const profile = await getUserProfile(session.user.id);
+        currentUser = { ...session.user, ...profile };
+        renderDashboard();
+        startLiveTicker();
+      } else {
+        renderLogin();
+      }
+    }
+    checkSession();
+  </script>
+</body>
+</html>
